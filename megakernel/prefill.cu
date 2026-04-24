@@ -343,6 +343,7 @@ extern "C" void launch_prefill_bf16(
     float *beta_buf, float *alpha_buf,
     __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
+    int max_seq_len,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -358,7 +359,7 @@ extern "C" void launch_prefill_bf16(
 
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
 
-    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    int fa_stride = FA_KV_HEADS * max_seq_len * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
     int fa_idx = 0, dn_idx = 0;
 
@@ -433,7 +434,7 @@ extern "C" void launch_prefill_bf16(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
 
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);

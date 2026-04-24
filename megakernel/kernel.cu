@@ -60,6 +60,8 @@ constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
 #define LM_BLOCK_SIZE 256
 #endif
 
+static int g_decode_blocks_override = 0;
+
 __device__ __constant__ int LAYER_TYPE[NUM_LAYERS] = {
     0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1
 };
@@ -695,7 +697,7 @@ __device__ void deltanet_layer(
             }
             stk = warp_reduce_sum(stk); sqv = warp_reduce_sum(sqv);
             stk = __shfl_sync(0xffffffff,stk,0); sqv = __shfl_sync(0xffffffff,sqv,0);
-            float error_j = (s_v[j] - stk) * beta;
+            float error_j = (s_v[j] - decay * stk) * beta;
             float o_j = decay * sqv + error_j * kq;
             if (lane_id == 0) out_head[j] = o_j;
 #pragma unroll
@@ -759,7 +761,9 @@ __global__ void lm_head_kernel(
     float *__restrict__ block_max_vals,
     int *__restrict__ block_max_idxs,
     int *__restrict__ output_token,
-    unsigned int *__restrict__ sync_counter)
+    unsigned int *__restrict__ sync_counter,
+    const float *__restrict__ seen_token_mask,
+    float repetition_penalty)
 {
     __shared__ float s_hidden[HIDDEN_SIZE];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LM_BLOCK_SIZE) s_hidden[i] = hidden[i];
@@ -781,6 +785,9 @@ __global__ void lm_head_kernel(
             for (int i = 0; i < 8; i++) sum += __bfloat162float(wp[i]) * s_hidden[k+i];
         }
         sum = warp_reduce_sum(sum);
+        if (lane_id == 0 && repetition_penalty > 1.0f && seen_token_mask && seen_token_mask[m] > 0.0f) {
+            sum = (sum > 0.0f) ? (sum / repetition_penalty) : (sum * repetition_penalty);
+        }
         if (lane_id == 0 && sum > local_max) { local_max = sum; local_max_idx = m; }
     }
     local_max = __shfl_sync(0xffffffff, local_max, 0);
@@ -840,24 +847,20 @@ decode_kernel(
     float *__restrict__ g_normalized,
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_generation,
+    float *__restrict__ seen_token_mask,
+    float repetition_penalty,
     int input_token_id, int position, int max_seq_len)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
 
-    // Initialize barrier
-    if (block_id == 0 && threadIdx.x == 0) { *barrier_counter = 0; *barrier_generation = 0; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        asm volatile("fence.acq_rel.gpu;" ::: "memory");
-        unsigned int arrived = atomicAdd(barrier_counter, 1);
-        if (arrived == (unsigned int)num_blocks - 1) { *barrier_counter = 0; asm volatile("fence.acq_rel.gpu;" ::: "memory"); atomicAdd(barrier_generation, 1); }
-        else { volatile unsigned int *vg = (volatile unsigned int *)barrier_generation; while (*vg == 0) {} }
-        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    if (block_id == 0 && threadIdx.x == 0 &&
+        seen_token_mask && repetition_penalty > 1.0f &&
+        input_token_id >= 0 && input_token_id < VOCAB_SIZE) {
+        seen_token_mask[input_token_id] = 1.0f;
     }
-    __syncthreads();
 
-    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 1};
+    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 0};
 
     // Shared memory: large enough for max(HIDDEN_SIZE bf16, INTERMEDIATE_SIZE f32)
     __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
@@ -916,6 +919,31 @@ decode_kernel(
 // C entry point
 // =============================================================================
 
+static int query_max_safe_decode_blocks_impl()
+{
+    int device_id = 0;
+    int sm_count = 0;
+    int active_blocks_per_sm = 0;
+    int max_safe_blocks = NUM_BLOCKS;
+
+    if (cudaGetDevice(&device_id) == cudaSuccess &&
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id) == cudaSuccess &&
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks_per_sm,
+            decode_kernel,
+            BLOCK_SIZE,
+            0) == cudaSuccess &&
+        sm_count > 0 &&
+        active_blocks_per_sm > 0) {
+        const int resident_blocks = sm_count * active_blocks_per_sm;
+        if (resident_blocks > 0) {
+            max_safe_blocks = resident_blocks;
+        }
+    }
+
+    return (max_safe_blocks < 1) ? 1 : max_safe_blocks;
+}
+
 extern "C" void launch_decode(
     int input_token_id, int *output_token_id,
     const void *embed_weight, const LayerWeights *layer_weights,
@@ -930,9 +958,26 @@ extern "C" void launch_decode(
     unsigned int *barrier_counter, unsigned int *barrier_generation,
     float *block_max_vals, int *block_max_idxs,
     unsigned int *lm_sync_counter,
+    float *seen_token_mask,
+    float repetition_penalty,
     int position, int max_seq_len, cudaStream_t stream)
 {
-    decode_kernel<<<NUM_BLOCKS, BLOCK_SIZE, 0, stream>>>(
+    const int max_safe_blocks = query_max_safe_decode_blocks_impl();
+    int decode_blocks = NUM_BLOCKS;
+    if (decode_blocks > max_safe_blocks) {
+        decode_blocks = max_safe_blocks;
+    }
+    if (g_decode_blocks_override > 0) {
+        decode_blocks = g_decode_blocks_override;
+        if (decode_blocks > max_safe_blocks) {
+            decode_blocks = max_safe_blocks;
+        }
+    }
+
+    cudaMemsetAsync(barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(barrier_generation, 0, sizeof(unsigned int), stream);
+
+    decode_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
         (const __nv_bfloat16 *)embed_weight,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)lm_head_weight,
@@ -946,6 +991,7 @@ extern "C" void launch_decode(
         (float *)g_z_scratch, (float *)g_beta_scratch,
         (float *)g_alpha_scratch, (float *)g_normalized,
         barrier_counter, barrier_generation,
+        seen_token_mask, repetition_penalty,
         input_token_id, position, max_seq_len);
 
     cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
@@ -954,6 +1000,16 @@ extern "C" void launch_decode(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         block_max_vals, block_max_idxs,
-        output_token_id, lm_sync_counter);
+        output_token_id, lm_sync_counter,
+        seen_token_mask, repetition_penalty);
 }
 
+extern "C" void set_decode_blocks_override(int blocks)
+{
+    g_decode_blocks_override = blocks;
+}
+
+extern "C" int query_max_safe_decode_blocks()
+{
+    return query_max_safe_decode_blocks_impl();
+}

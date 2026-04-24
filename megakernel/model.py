@@ -27,13 +27,31 @@ DN_CONV_KERNEL = 4
 LAYER_TYPE = [0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1]
 
 _decode = None
+_max_safe_decode_blocks = None
+_set_decode_blocks = None
 
 
 def _load_op():
-    global _decode
+    global _decode, _max_safe_decode_blocks, _set_decode_blocks
     if _decode is None:
         import qwen35_megakernel_bf16_C
         _decode = torch.ops.qwen35_megakernel_bf16_C.decode
+        _max_safe_decode_blocks = torch.ops.qwen35_megakernel_bf16_C.max_safe_decode_blocks
+        _set_decode_blocks = torch.ops.qwen35_megakernel_bf16_C.set_decode_blocks
+
+
+def max_safe_decode_blocks() -> int:
+    """Return the resident-block ceiling for the current CUDA device."""
+    _load_op()
+    return int(_max_safe_decode_blocks())
+
+
+def set_decode_blocks(blocks: int):
+    """Override decode blocks, clamped by the CUDA resident-block ceiling."""
+    if blocks < 0:
+        raise ValueError("blocks must be non-negative")
+    _load_op()
+    _set_decode_blocks(int(blocks))
 
 
 def load_weights(model_name="Qwen/Qwen3.5-0.8B", verbose=True):
@@ -143,18 +161,29 @@ class Decoder:
     """Stateful decoder for Qwen3.5-0.8B bf16 megakernel."""
 
     def __init__(self, weights=None, tokenizer=None,
-                 model_name="Qwen/Qwen3.5-0.8B", verbose=True):
+                 model_name="Qwen/Qwen3.5-0.8B", verbose=True,
+                 max_seq_len=MAX_SEQ_LEN, repetition_penalty=1.0,
+                 decode_blocks=None):
         _load_op()
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if repetition_penalty < 1.0:
+            raise ValueError("repetition_penalty must be >= 1.0")
+        if decode_blocks is not None and decode_blocks < 0:
+            raise ValueError("decode_blocks must be non-negative")
 
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
+        self.max_seq_len = int(max_seq_len)
+        self.repetition_penalty = float(repetition_penalty)
         self._weights = weights
         self._embed_weight = weights["embed_weight"]
         self._final_norm_weight = weights["final_norm_weight"]
         self._lm_head_weight = weights["lm_head_weight"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_data"])
+        _set_decode_blocks(0 if decode_blocks is None else int(decode_blocks))
 
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
@@ -162,7 +191,7 @@ class Decoder:
         u32 = dict(dtype=torch.uint32, device="cuda")
 
         n_fa = sum(1 for t in LAYER_TYPE if t == 1)
-        self._fa_k_cache = torch.zeros(n_fa, FA_NUM_KV_HEADS, MAX_SEQ_LEN, FA_HEAD_DIM, **bf16)
+        self._fa_k_cache = torch.zeros(n_fa, FA_NUM_KV_HEADS, self.max_seq_len, FA_HEAD_DIM, **bf16)
         self._fa_v_cache = torch.zeros_like(self._fa_k_cache)
 
         n_dn = sum(1 for t in LAYER_TYPE if t == 0)
@@ -187,10 +216,13 @@ class Decoder:
         self._block_max_vals = torch.empty(1024, **f32)
         self._block_max_idxs = torch.empty(1024, **i32)
         self._lm_sync_counter = torch.zeros(1, **u32)
+        self._seen_token_mask = torch.zeros(VOCAB_SIZE, **f32)
         self._out_token = torch.empty(1, **i32)
 
     def step(self, token_id: int) -> int:
         """Decode one token. Returns next token id."""
+        if self._position >= self.max_seq_len:
+            raise ValueError(f"position {self._position} exceeds max_seq_len={self.max_seq_len}")
         _decode(
             self._out_token, token_id,
             self._embed_weight, self._layer_weights_packed,
@@ -204,7 +236,8 @@ class Decoder:
             self._barrier_counter, self._barrier_generation,
             self._block_max_vals, self._block_max_idxs,
             self._lm_sync_counter,
-            self._position, MAX_SEQ_LEN,
+            self._seen_token_mask, self.repetition_penalty,
+            self._position, self.max_seq_len,
         )
         self._position += 1
         return self._out_token.item()
@@ -215,6 +248,7 @@ class Decoder:
         self._fa_v_cache.zero_()
         self._dn_states.zero_()
         self._conv_bufs.zero_()
+        self._seen_token_mask.zero_()
 
     def generate(self, prompt: str, max_tokens: int = 100) -> str:
         self.reset()

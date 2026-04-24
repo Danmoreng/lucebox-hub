@@ -76,7 +76,7 @@ A single persistent CUDA kernel processes the entire Qwen 3.5-0.8B forward pass 
 **Architecture:** Qwen 3.5-0.8B is a hybrid model, 18 DeltaNet layers (linear attention with learned recurrence) and 6 full attention layers, in a 3:1 ratio. DeltaNet scales linearly with context length vs. quadratic for standard attention. It's an emerging pattern in next-gen models (Qwen3-Next, Kimi Linear), but no framework had optimized kernels for it.
 
 **Kernel specs:**
-- 82 blocks, 512 threads, all SMs on the RTX 3090 kept occupied
+- 82 blocks, 512 threads, all SMs on the RTX 3090 kept occupied; launch count is clamped to the resident-block ceiling on smaller GPUs to avoid grid-sync deadlock
 - BF16 weights and activations, FP32 accumulation where it matters
 - DeltaNet recurrence via warp-cooperative state updates in F32 registers
 - Full attention with online softmax (fused QKV, RoPE, causal mask, output projection)

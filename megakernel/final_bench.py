@@ -48,7 +48,8 @@ def our_prefill():
         b['hidden'], b['residual'], b['normalized'],
         b['proj_buf'], b['proj_buf2'], b['attn_buf'], b['mlp_buf'],
         b['dn_out_buf'], b['beta_buf'], b['alpha_buf'],
-        b['final_normed'], b['hidden_bf16_out'], b['lm_bmv'], b['lm_bmi'])
+        b['final_normed'], b['hidden_bf16_out'], b['lm_bmv'], b['lm_bmi'],
+        dec.max_seq_len)
     dec._hidden.copy_(b['hidden_bf16_out'])
     dec._position = len(prompt_ids)
     return dec._out_token.item()

@@ -41,7 +41,12 @@ extern "C" void launch_decode(
     unsigned int *barrier_counter, unsigned int *barrier_generation,
     float *block_max_vals, int *block_max_idxs,
     unsigned int *lm_sync_counter,
+    float *seen_token_mask,
+    float repetition_penalty,
     int position, int max_seq_len, cudaStream_t stream);
+
+extern "C" void set_decode_blocks_override(int blocks);
+extern "C" int query_max_safe_decode_blocks();
 
 void decode(
     torch::Tensor output_token, int64_t input_token_id,
@@ -55,7 +60,8 @@ void decode(
     torch::Tensor alpha_scratch, torch::Tensor normalized,
     torch::Tensor barrier_counter, torch::Tensor barrier_generation,
     torch::Tensor block_max_vals, torch::Tensor block_max_idxs,
-    torch::Tensor lm_sync_counter, int64_t position, int64_t max_seq_len)
+    torch::Tensor lm_sync_counter, torch::Tensor seen_token_mask,
+    double repetition_penalty, int64_t position, int64_t max_seq_len)
 {
     launch_decode(
         (int)input_token_id, (int*)output_token.data_ptr(),
@@ -71,8 +77,19 @@ void decode(
         (unsigned int*)barrier_counter.data_ptr(), (unsigned int*)barrier_generation.data_ptr(),
         (float*)block_max_vals.data_ptr(), (int*)block_max_idxs.data_ptr(),
         (unsigned int*)lm_sync_counter.data_ptr(),
+        (float*)seen_token_mask.data_ptr(), (float)repetition_penalty,
         (int)position, (int)max_seq_len,
         c10::cuda::getCurrentCUDAStream().stream());
+}
+
+int64_t max_safe_decode_blocks()
+{
+    return query_max_safe_decode_blocks();
+}
+
+void set_decode_blocks(int64_t blocks)
+{
+    set_decode_blocks_override((int)blocks);
 }
 
 // ===== Prefill BF16 =====
@@ -87,6 +104,7 @@ extern "C" void launch_prefill_bf16(
     void *dn_out_buf, void *beta_buf, void *alpha_buf,
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
+    int max_seq_len,
     cudaStream_t stream);
 
 void prefill_bf16(
@@ -100,7 +118,8 @@ void prefill_bf16(
     torch::Tensor attn_buf, torch::Tensor mlp_buf,
     torch::Tensor dn_out_buf, torch::Tensor beta_buf, torch::Tensor alpha_buf,
     torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
-    torch::Tensor lm_bmv, torch::Tensor lm_bmi)
+    torch::Tensor lm_bmv, torch::Tensor lm_bmi,
+    int64_t max_seq_len)
 {
     launch_prefill_bf16(
         (const int*)token_ids.data_ptr(), token_ids.size(0),
@@ -116,6 +135,7 @@ void prefill_bf16(
         dn_out_buf.data_ptr(), beta_buf.data_ptr(), alpha_buf.data_ptr(),
         final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
+        (int)max_seq_len,
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -130,8 +150,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor alpha_scratch, Tensor normalized, "
             "Tensor barrier_counter, Tensor barrier_generation, "
             "Tensor block_max_vals, Tensor block_max_idxs, Tensor lm_sync_counter, "
+            "Tensor seen_token_mask, float repetition_penalty, "
             "int position, int max_seq_len) -> ()");
     ops.impl("decode", torch::kCUDA, &decode);
+
+    ops.def("max_safe_decode_blocks() -> int");
+    ops.impl("max_safe_decode_blocks", &max_safe_decode_blocks);
+
+    ops.def("set_decode_blocks(int blocks) -> ()");
+    ops.impl("set_decode_blocks", &set_decode_blocks);
 
     ops.def("prefill_bf16(Tensor output_token, Tensor token_ids, "
             "Tensor embed_weight, Tensor layer_weights_packed, "
@@ -141,7 +168,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor proj_buf, Tensor proj_buf2, Tensor attn_buf, Tensor mlp_buf, "
             "Tensor dn_out_buf, Tensor beta_buf, Tensor alpha_buf, "
             "Tensor final_normed, Tensor hidden_bf16_out, "
-            "Tensor lm_bmv, Tensor lm_bmi) -> ()");
+            "Tensor lm_bmv, Tensor lm_bmi, int max_seq_len) -> ()");
     ops.impl("prefill_bf16", torch::kCUDA, &prefill_bf16);
 }
 

@@ -48,7 +48,7 @@ def prefill(ids):
         bufs['attn_buf'], bufs['mlp_buf'],
         bufs['dn_out_buf'], bufs['beta_buf'], bufs['alpha_buf'],
         bufs['final_normed'], bufs['hidden_bf16_out'],
-        bufs['lm_bmv'], bufs['lm_bmi'])
+        bufs['lm_bmv'], bufs['lm_bmi'], dec.max_seq_len)
     # Handoff: copy hidden state for decode kernel
     dec._hidden.copy_(bufs['hidden_bf16_out'])
     dec._position = len(ids)
